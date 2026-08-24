@@ -1,0 +1,209 @@
+================================================================================
+🔴 ERROR DETAILS - PR #13840 Test Failure - HALAMAN 1 DARI 2
+================================================================================
+
+Test Name: "derives image pricing transitions and private visibility"
+File: enter.pollinations.ai/test/integration/community-endpoint-policy.test.ts
+Line: 164-170
+Error Type: AssertionError - Field Mismatch
+Status: ❌ FAILED
+Severity: 🔴 HIGH
+
+================================================================================
+ERROR MESSAGE
+================================================================================
+
+AssertionError: expected { …(31) } to match object { imagePricing: 'tokens', …(4) }
+
+Expected Response:
+{
+    imagePricing: 'tokens',
+    promptTextPrice: 0,
+    promptImagePrice: 0.000001,
+    completionImagePrice: 0,
+    paidOnly: true
+}
+
+Actual Response: Structure doesn't match - missing or wrong field values
+
+================================================================================
+DETAILED BREAKDOWN
+================================================================================
+
+STEP 1: Create Image Pricing Model ✅
+─────────────────────────────────────
+
+Test creates a new community endpoint:
+  POST /api/account/my-models
+  Body: {
+      name: "image-policy",
+      title: "Image policy",
+      visibility: "public",
+      baseUrl: "https://images.example.com/v1",
+      bearerToken: "test-provider-token",
+      modality: "image",
+      imagePricing: "request",          ← Initial pricing mode
+      inputModalities: ["text", "image"],
+      paidOnly: true,
+      perUserRpm: 2.5,
+      completionImagePrice: 0.2,
+  }
+
+Expected Response:
+  {
+      modality: "image",
+      imagePricing: "request",
+      inputModalities: ["text", "image"],
+      paidOnly: true,
+      perUserRpm: 2.5,
+      completionImagePrice: 0.2,
+  }
+
+Result: ✅ PASS - Image model created successfully
+
+
+STEP 2: Update Image Pricing from "request" to "tokens" ❌
+──────────────────────────────────────────────────────────
+
+Test sends UPDATE request:
+  POST /api/account/my-models/{id}/update
+  Body: {
+      imagePricing: "tokens",           ← CHANGE from "request" to "tokens"
+      promptImagePrice: 0.000001,       ← Set token-based pricing
+  }
+
+Expected Response (Test Assertion Line 164-170):
+  {
+      imagePricing: "tokens",           ← FAIL: Field missing or wrong
+      promptTextPrice: 0,               ← FAIL: Should be 0 (reset)
+      promptImagePrice: 0.000001,       ← FAIL: User-set value
+      completionImagePrice: 0,          ← FAIL: Should be 0 (reset)
+      paidOnly: true,                   ← FAIL: Should preserve
+  }
+
+What Should Happen:
+  1. API receives update request with imagePricing change
+  2. deriveUpdatedProxyPolicy() recalculates prices
+  3. Price fields reset when switching from "request" to "tokens"
+  4. Response should include ALL price fields with correct values
+
+What Actually Happens:
+  ❌ Response is missing or has wrong values for the expected fields
+
+================================================================================
+ROOT CAUSE - WHERE THE PROBLEM IS
+================================================================================
+
+The error occurs in this workflow:
+
+  Test sends UPDATE
+       ↓
+  API Handler processes request
+       ↓
+  deriveUpdatedProxyPolicy() - Derive new pricing policy
+       ↓
+  Update database with new payload
+       ↓
+  toCommunityEndpointResponse() - Format response
+       ↓
+  ❌ Response returned doesn't match expected structure
+
+KEY ISSUE:
+  When imagePricing changes from "request" to "tokens", the API should:
+  1. Reset all non-applicable price fields to 0
+  2. Include user-provided price (0.000001)
+  3. Return ALL price fields in response
+
+  BUT: Response is missing one or more of these fields.
+
+================================================================================
+TECHNICAL DETAILS
+================================================================================
+
+File 1: src/routes/community-endpoints/proxy-policy.ts
+───────────────────────────────────────────────────────
+
+Function: updatePriceSource() [Lines 165-182]
+
+When imagePricing changes, prices must be recalculated:
+
+    const resetPrices =
+        imagePricing === stored.imagePricing  
+            ? {}                              
+            : Object.fromEntries(
+                  communityEndpointPriceFieldsForModality(
+                      stored.modality,
+                      imagePricing,            ← New pricing mode
+                  )
+                      .filter((field) => input[field.key] === undefined)
+                      .map((field) => [field.key, 0]),  ← Reset to 0
+              );
+
+ISSUE: This should reset promptTextPrice and completionImagePrice to 0
+       But response doesn't show these fields.
+
+
+File 2: src/routes/community-endpoints.ts
+──────────────────────────────────────────
+
+Handler at Lines 676-838 for POST /:id/update
+
+1. Gets stored endpoint payload
+2. Calls deriveUpdatedProxyPolicy(stored, input, visibility)
+3. Creates new ProxyListingPayload with spread policy
+4. Saves to database
+5. Returns toCommunityEndpointResponse(row)
+
+ISSUE: The response serialization might not include all fields.
+
+
+File 3: src/routes/community-endpoints/presenter.ts
+─────────────────────────────────────────────────────
+
+Function: toCommunityEndpointResponse() [Lines 64-101]
+
+    const payload = parseListingPayload("proxy", row.payload);
+    const { bearerTokenCiphertext: _credential, prices, ...proxy } = payload;
+    
+    return {
+        ...common,
+        type: row.type,
+        ...proxy,           ← Should include imagePricing, modality, etc
+        advertised: normalizeCommunityEndpointAdvertised(...),
+        ...prices,          ← Should include promptTextPrice, etc
+        pending,
+    }
+
+ISSUE: The prices object might not be properly destructured/spread
+       OR the payload structure is wrong
+
+================================================================================
+SUSPECTED ROOT CAUSES (In Order of Likelihood)
+================================================================================
+
+CAUSE #1 (Most Likely):
+  The prices object in ProxyListingPayload doesn't contain all expected fields
+  after the imagePricing change.
+  
+  When switching from "request" to "tokens":
+    Before: prices = { promptImagePrice: 0.2, completionImagePrice: ..., ... }
+    After:  prices = { promptImagePrice: 0.000001, promptTextPrice: ?, ... }
+  
+  Some fields might be MISSING from the prices object entirely.
+
+
+CAUSE #2 (Likely):
+  The toCommunityEndpointResponse() function doesn't properly spread the prices
+  object into the response, causing fields to be missing in the final JSON.
+
+
+CAUSE #3 (Possible):
+  The ProxyListingPayload type definition is missing some price fields,
+  so TypeScript strips them during serialization/deserialization.
+
+
+CAUSE #4 (Less Likely):
+  The test expectation is correct but database save failed silently,
+  returning the OLD payload instead of updated one.
+
+================================================================================
